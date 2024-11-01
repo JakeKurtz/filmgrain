@@ -196,11 +196,11 @@ __DEVICE__ float blah(__TEXTURE2D__ src, int x, int y, int img_width, int img_he
       unsigned int maxY = (unsigned int)floor( ( (double)yGaussian + (double)maxRadius)/((double)ag));
 
       bool ptCovered = false; // used to break all for loops
-      unsigned int ncx = minX;
-      //for(unsigned int ncx = minX; ncx <= maxX; ncx++) // x-cell number
-      //{
-      //  if(ptCovered == true)
-      //    break;
+
+      for(unsigned int ncx = minX; ncx <= maxX; ncx++) // x-cell number
+      {
+        if(ptCovered == true)
+          break;
         for(unsigned int ncy = minY; ncy <= maxY; ncy++) // y-cell number
         {
           if(ptCovered == true)
@@ -212,10 +212,9 @@ __DEVICE__ float blah(__TEXTURE2D__ src, int x, int y, int img_width, int img_he
           mysrand(&p,seed);
 
           // Compute the Poisson parameters for the pixel that contains (x,y)
-          float foo = (max(floor(xGaussian),0.0f) / (img_width-1));
-          float bar = (max(floor(yGaussian),0.0f) / (img_height-1));
-
-          float4 src_im_sxsy = to_float4_s(1.f);//clamp(_tex2DVec4(src, foo, bar), to_float4_s(0.f), to_float4_s(1.f));
+          float _u = (max(floor(xGaussian),0.0f) / (img_width-1));
+          float _v = (max(floor(yGaussian),0.0f) / (img_height-1));
+          float4 src_im_sxsy = clamp(_tex2DVec4(src, _u, _v), to_float4_s(0.f), to_float4_s(1.f));
 
           float shade;
           if (col_channel == 0) {
@@ -229,7 +228,7 @@ __DEVICE__ float blah(__TEXTURE2D__ src, int x, int y, int img_width, int img_he
           float currLambda = currLambda_factor * log(1.f - shade);
           float currExpLambda = exp(-currLambda);
 
-          unsigned int Ncell = 1;//my_rand_poisson(&p, currLambda, currExpLambda);
+          unsigned int Ncell = my_rand_poisson(&p, currLambda, currExpLambda);
 
           for(unsigned int k=0; k<Ncell; k++)
           {
@@ -257,7 +256,7 @@ __DEVICE__ float blah(__TEXTURE2D__ src, int x, int y, int img_width, int img_he
             }
           }
         } 	//end ncy
-     // }		//end ncx
+      }		//end ncx
       ptCovered = false;
     }		//end monte carlo
 
