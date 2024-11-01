@@ -1,0 +1,401 @@
+-- -------------------------------------------------------------------------- --
+--                            Registry declaration                            --
+-- -------------------------------------------------------------------------- --
+
+FuRegisterClass("PassthroughExample", CT_SourceTool, {
+  REGS_Category      = "Effect",
+  REGS_OpIconString  = "Passthrough",
+  REGS_OpDescription = "GPU Sample Fuse",
+
+  REG_NoObjMatCtrls      = true,
+  REG_NoMotionBlurCtrls  = true,
+
+  REG_Source_GlobalCtrls = false,
+  REG_Source_SizeCtrls   = true,
+  REG_Source_AspectCtrls = true,
+  REG_Source_DepthCtrls  = true,
+  REG_OpNoMask           = true,
+  REG_Fuse_NoEdit        = true,
+  REG_Fuse_NoReload      = true,
+
+  REG_TimeVariant        = true,
+  })
+
+-- -------------------------------------------------------------------------- --
+--                                  DCTL CODE                                 --
+-- -------------------------------------------------------------------------- --
+
+-- Description of kernel parameters
+
+KernelParams =
+[[
+  int width;
+  int height;
+  float frame;
+  float grainRadius;
+  float sigmaFilter;
+  int nMonteCarlo;
+]]
+
+-- source of main kernel
+
+MainKernelSource =
+[[
+const float pi = 3.141592;
+
+//const float grainRadius = 0.15f;
+const float grainSigma = 0.0;
+//const float sigmaFilter = 0.8f;
+
+// Produces random seed.
+__DEVICE__ unsigned int wang_hash(unsigned int seed)
+{
+  seed = (seed ^ 61u) ^ (seed >> 16u);
+  seed *= 9u;
+  seed = seed ^ (seed >> 4u);
+  seed *= 668265261u;
+  seed = seed ^ (seed >> 15u);
+  return(seed);
+}
+
+// Generate unique seed for a a cell, given the coordinates of the cell
+__DEVICE__ unsigned int cellseed(unsigned int x, unsigned int y, unsigned int offset)
+{
+  const unsigned int period = 65536u; // 65536 = 2^16
+  unsigned int s = (( y % period) * period + (x % period)) + offset;
+  if (s == 0u) s = 1u;
+  return(s);
+}
+
+__DEVICE__ void mysrand(unsigned int  *p, const unsigned int seed)
+{
+    unsigned int s=seed;
+    *p = wang_hash(s);
+}
+
+__DEVICE__ unsigned int myrand(unsigned int  *p)
+{
+// linear congruential generator: procudes correlated output. Similar patterns are visible
+// p.state = 1664525u * p.state + 1013904223u;
+// Xorshift algorithm from George Marsaglia's paper
+  *p ^= (*p << 13u);
+  *p ^= (*p >> 17u);
+  *p ^= (*p << 5u);  
+  return(*p);
+}
+
+__DEVICE__ float myrand_uniform_0_1(unsigned int *p)
+{
+    return(((float) myrand(p)) / ((float) 4294967295u));
+}
+
+__DEVICE__ float myrand_gaussian_0_1(unsigned int  *p)
+{
+    /* Box-Muller method for generating standard Gaussian variate */
+    float u = myrand_uniform_0_1(p);
+    float v = myrand_uniform_0_1(p);
+    return( sqrt(-2.0 * log(u)) * cos(2.0 * pi * v) );
+}
+
+__DEVICE__ unsigned int my_rand_poisson(unsigned int *prngstate, float lambda, float expLambda)
+{
+  // Inverse transform sampling
+  float u=myrand_uniform_0_1(prngstate);
+  unsigned int x = 0u;
+  //float prod = exp(-lambda); // this should be passed as an argument if used extensively with the same value lambda
+  float prod = expLambda;
+  float sum = prod;
+  while ( (u>sum) && (x<floor(10000.0f*lambda)))
+  {
+    x = x + 1u;
+    prod = prod * lambda /((float) x);
+    sum = sum + prod;
+  }
+  return(x);
+
+    //return unsigned(floor(lambda + 0.5 + (sqrt(lambda) * myrand_gaussian_0_1(prngstate))));
+}
+
+__DEVICE__ double sqDistance(const double x1, const double y1, const double x2, const double y2)
+{
+  return((x1-x2)*(x1-x2) + (y1-y2)*(y1-y2));
+}
+
+__DEVICE__ float curr_lambda_factor(float grainRadius)
+{
+    float ag = 1.0f / ceil(1.0f / grainRadius);
+    float ag2 = ag * ag;
+    float muR = grainRadius;
+    float muR2 = muR * muR;
+    float sigmaR = grainSigma;
+    float sigmaR2 = sigmaR * sigmaR;
+
+    return -(ag2 / (pi * (muR2 + sigmaR2)));
+}
+
+__DEVICE__ float blah(__TEXTURE2D__ src, int x, int y, int img_width, int img_height, int frame, int col_channel, float grainRadius, float sigmaFilter, int nMonteCarlo)
+{
+    float out_w = img_width-1;
+    float out_h = img_height-1;
+    float xA = 0.0;
+    float xB = img_width-1;
+    float yA = 0.0;
+    float yB = img_height-1;
+
+    float normalQuantile = 3.0902;//2.3263;	//standard normal quantile for alpha=0.999
+    float logNormalQuantile;
+    float grainRadiusSq = grainRadius*grainRadius;
+    float currRadius,currGrainRadiusSq;
+    float mu, sigma, sigmaSq;
+    float maxRadius = grainRadius;
+
+    float currLambda_factor = curr_lambda_factor(grainRadius);
+
+    float ag = 1/ceil(1/grainRadius);
+    float sX = ((float)(img_width-1))/((float)(xB-xA)); 
+    float sY = ((float)(img_height-1))/((float)(yB-yA));
+
+    //calculate the mu and sigma for the lognormal distribution
+    if (grainSigma > 0.0)
+    {
+      sigma = sqrt(log( (grainSigma/grainRadius)*(grainSigma/grainRadius) + (float)1.0));
+      sigmaSq = sigma*sigma;
+      mu = log(grainRadius)-sigmaSq/((float)2.0);
+      logNormalQuantile = exp(mu + sigma*normalQuantile);
+      maxRadius = logNormalQuantile;
+    }
+
+    float pixOut=0.0, u;
+    unsigned int offsetRand = frame;
+
+    //conversion from output grid (xOut,yOut) to input grid (xIn,yIn)
+    //we inspect the middle of the output pixel (1/2)
+    //the size of a pixel is (xB-xA)/nOut
+    float _x = xA + ((float)x+(float)0.5 ) * ((xB-xA)/((float)out_w));
+    float _y = yA + ((float)y+(float)0.5 ) * ((yB-yA)/((float)out_h));
+
+    // Simulate Poisson process on the 4 neighborhood cells of (x,y)
+    unsigned int pMonteCarlo;
+    unsigned int p;
+    mysrand(&pMonteCarlo, ((unsigned int)2016)*(offsetRand));
+
+    for (int i=0; i<nMonteCarlo; i++)
+    {
+
+      float xGaussian = myrand_gaussian_0_1(&pMonteCarlo);
+      float yGaussian = myrand_gaussian_0_1(&pMonteCarlo);
+
+      xGaussian = _x + sigmaFilter*(xGaussian)/sX;
+      yGaussian = _y + sigmaFilter*(yGaussian)/sY;
+
+      //determine the bounding boxes around the current shifted pixel
+      // these operations are set to double precision because the number of cells can be quite large
+      unsigned int minX = (unsigned int)floor( ( (double)xGaussian - (double)maxRadius)/((double)ag));
+      unsigned int maxX = (unsigned int)floor( ( (double)xGaussian + (double)maxRadius)/((double)ag));
+      unsigned int minY = (unsigned int)floor( ( (double)yGaussian - (double)maxRadius)/((double)ag));
+      unsigned int maxY = (unsigned int)floor( ( (double)yGaussian + (double)maxRadius)/((double)ag));
+
+      bool ptCovered = false; // used to break all for loops
+      unsigned int ncx = minX;
+      //for(unsigned int ncx = minX; ncx <= maxX; ncx++) // x-cell number
+      //{
+      //  if(ptCovered == true)
+      //    break;
+        for(unsigned int ncy = minY; ncy <= maxY; ncy++) // y-cell number
+        {
+          if(ptCovered == true)
+            break;
+          double cellCornerX = ((double)ag)*((double)ncx);
+          double cellCornerY = ((double)ag)*((double)ncy);
+
+          unsigned int seed = cellseed(ncx, ncy, offsetRand);
+          mysrand(&p,seed);
+
+          // Compute the Poisson parameters for the pixel that contains (x,y)
+          float foo = (max(floor(xGaussian),0.0f) / (img_width-1));
+          float bar = (max(floor(yGaussian),0.0f) / (img_height-1));
+
+          float4 src_im_sxsy = to_float4_s(1.f);//clamp(_tex2DVec4(src, foo, bar), to_float4_s(0.f), to_float4_s(1.f));
+
+          float shade;
+          if (col_channel == 0) {
+            shade = src_im_sxsy.r;
+          } else if (col_channel == 1) {
+            shade = src_im_sxsy.g;
+          } else if (col_channel == 2) {
+            shade = src_im_sxsy.b;
+          }
+
+          float currLambda = currLambda_factor * log(1.f - shade);
+          float currExpLambda = exp(-currLambda);
+
+          unsigned int Ncell = 1;//my_rand_poisson(&p, currLambda, currExpLambda);
+
+          for(unsigned int k=0; k<Ncell; k++)
+          {
+            //draw the grain centre
+            //changed to double precision to avoid incorrect operations
+            double xCentreGrain = (double)cellCornerX + ((double)ag)*((double)myrand_uniform_0_1(&p));
+            double yCentreGrain = (double)cellCornerY + ((double)ag)*((double)myrand_uniform_0_1(&p));
+
+            //draw the grain radius
+            if (grainSigma>0.0)
+            {
+              //draw a random Gaussian radius, and convert it to log-normal
+              currRadius = (float)fmin((float)exp(mu + sigma*myrand_gaussian_0_1(&p)),maxRadius);//myrand_uniform_0_1(&p);//
+              currGrainRadiusSq = currRadius*currRadius;
+            }
+            else
+              currGrainRadiusSq = grainRadiusSq;
+
+            // test distance
+            if(sqDistance(xCentreGrain, yCentreGrain, xGaussian, yGaussian) < (double)currGrainRadiusSq)
+            {
+              pixOut = pixOut+(float)1.0;
+              ptCovered = true;
+              break;
+            }
+          }
+        } 	//end ncy
+     // }		//end ncx
+      ptCovered = false;
+    }		//end monte carlo
+
+    // store output
+    return pixOut/((float)nMonteCarlo);//lambda;//
+}
+
+__KERNEL__ void MainKernel(__CONSTANTREF__ KernelParams *params, __TEXTURE2D__ src, __TEXTURE2D_WRITE__ dst)
+{
+  DEFINE_KERNEL_ITERATORS_XY(x, y);
+  if (x < params->width && y < params->height) 
+  {
+    int img_width = params->width;
+    int img_height = params->height;
+
+    float R = blah(src, x, y, img_width, img_height, params->frame, 0, params->grainRadius, params->sigmaFilter, params->nMonteCarlo);
+    float G = blah(src, x, y, img_width, img_height, params->frame, 1, params->grainRadius, params->sigmaFilter, params->nMonteCarlo);
+    float B = blah(src, x, y, img_width, img_height, params->frame, 2, params->grainRadius, params->sigmaFilter, params->nMonteCarlo);
+
+    float4 colour = to_float4(R, G, B, 1.0);
+    _tex2DVec4Write(dst, x, y, colour);
+  }
+}
+]]
+
+-- -------------------------------------------------------------------------- --
+--                                   Create                                   --
+-- -------------------------------------------------------------------------- --
+
+function Create()
+
+  --------------- Parameters ---------------
+  InGrainRadius = self:AddInput("Grain Radius", "InGrainRadius", {
+    LINKID_DataType     = "Number",
+    INPID_InputControl  = "ScrewControl",
+    INP_Default         = 0.15,
+    INP_MinAllowed      = 0.0001,
+    INP_MaxAllowed      = 1.0,
+  })
+  InSigmaFilter = self:AddInput("Sigma Filter", "InSigmaFilter", {
+    LINKID_DataType     = "Number",
+    INPID_InputControl  = "ScrewControl",
+    INP_Default         = 0.8,
+    INP_MinAllowed      = 0.0,
+    INP_MaxAllowed      = 5.0,
+  })
+  InSamples = self:AddInput("Samples", "Samples", {
+    LINKID_DataType = "Number",
+    INPID_InputControl = "ScrewControl",
+    INP_Integer = true,
+    INP_Default        = 50,
+    INP_MinAllowed = 1,
+    INP_MaxAllowed = 250,
+  })
+
+------------------- In/Out -----------------
+  InImage1 = self:AddInput("Image", "Image", {
+    LINKID_DataType = "Image",
+    LINK_Main = 1,
+    INP_Required = false
+  })
+
+  OutImage = self:AddOutput("Output", "Output", {
+    LINKID_DataType = "Image",
+    LINK_Main = 1,
+  })
+end
+
+-- -------------------------------------------------------------------------- --
+--                                   Process                                  --
+-- -------------------------------------------------------------------------- --
+
+function Process(req)
+
+    local framerate = self.Comp:GetPrefs("Comp.FrameFormat.Rate") -- get the frame rate of the comp set in the preferences
+
+    --This creates an image for us to work on.
+    local imgattrs = {
+        IMG_Document = self.Comp,
+        { IMG_Channel = "Red", },
+        { IMG_Channel = "Green", },
+        { IMG_Channel = "Blue", },
+        { IMG_Channel = "Alpha", },
+        IMG_Width = Width,
+        IMG_Height = Height,
+        IMG_XScale = XAspect,
+        IMG_YScale = YAspect,
+        IMAT_OriginalWidth = realwidth,
+        IMAT_OriginalHeight = realheight,
+        IMG_Quality = not req:IsQuick(),
+        IMG_MotionBlurQuality = not req:IsNoMotionBlur(),
+        }
+
+    if not req:IsStampOnly() then
+        imgattrs.IMG_ProxyScale = 1
+    end
+
+    if SourceDepth ~= 0 then
+        imgattrs.IMG_Depth = SourceDepth
+    end
+
+    -- Extern Texture or create a new one
+
+    if (InImage1:GetValue(req) ~= nil) then
+        src = InImage1:GetValue(req)
+    else
+        src = Image(imgattrs)
+        local p = Pixel({R=0,G=0,B=0,A=0}) -- Initial black Image to avoid see random picture from Memory
+        src:Fill(p)
+    end
+
+	  local dst = Image {IMG_Like = src, IMG_DeferAlloc = true}
+
+    -- --------------------------------- kernel --------------------------------- --
+
+    node = DVIPComputeNode(req, "MainKernel", MainKernelSource, "KernelParams", KernelParams)
+
+    local params = node:GetParamBlock(KernelParams)
+
+    params.width  = src.DataWindow:Width()
+    params.height = src.DataWindow:Height()
+    params.frame = req.Time
+    params.grainRadius = InGrainRadius:GetValue(req).Value
+    params.sigmaFilter = InSigmaFilter:GetValue(req).Value
+    params.nMonteCarlo = InSamples:GetValue(req).Value
+
+    node:SetParamBlock(params)
+
+    node:AddSampler("RowSampler", TEX_FILTER_MODE, LINEAR, TEX_ADDRESS_MODE_CLAMP, TEX_NORMALIZED, COORDS_TRUE)
+    node:AddInput("src", src)
+    node:AddOutput("dst", dst)
+
+    local success = node:RunSession(req)
+    if not success then
+        dst = nil
+        dump(node:GetErrorLog())
+    end
+
+    OutImage:Set(req, dst)
+	collectgarbage();
+end
